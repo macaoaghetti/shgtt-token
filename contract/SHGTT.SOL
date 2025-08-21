@@ -1,0 +1,258 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   SHGTT Token (BSC)
+   - Total supply: 10,000,000,000 SHGTT (18 decimals)
+   - Founder allocation at deploy: 30% to founder wallet
+   - Fees on every transfer (buy/sell/transfer):
+       * Founder/Dev:    14%
+       * Ecosystem:       6%
+       * CommunityRewards 4%
+       * Burn:            1%  (sent to 0x...dEaD, reduces totalSupply)
+     Total fees = 25% (capped; owner can adjust but never exceed 25%)
+   - Owner controls: enable/disable fees, update fee BPs, update wallets,
+     exclude addresses from fees, withdraw stuck tokens.
+   - Designed for Thirdweb/Remix deployment on BSC mainnet.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+contract Ownable {
+    address public owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor() {
+        owner = msg.sender;
+        emit OwnershipTransferred(address(0), msg.sender);
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Zero newOwner");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+}
+
+interface IERC20 {
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external pure returns (uint8);
+
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address who) external view returns (uint256);
+
+    function transfer(address to, uint256 value) external returns (bool);
+    function allowance(address who, address spender) external view returns (uint256);
+    function approve(address spender, uint256 value) external returns (bool);
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+contract SHGTT is IERC20, Ownable {
+    string private constant _name   = "SHGTT";
+    string private constant _symbol = "SHGTT";
+    uint8  public  constant override decimals = 18;
+
+    // Supply
+    uint256 private _totalSupply;
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    // Wallets
+    address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    address public founderWallet = 0xa10bcdC133EB9866F71f027bE89b185648CfC2c2; // <- YOUR founder wallet
+    address public ecosystemWallet = 0xa10bcdC133EB9866F71f027bE89b185648CfC2c2; // can be changed later
+    address public rewardsWallet   = 0xa10bcdC133EB9866F71f027bE89b185648CfC2c2; // can be changed later
+
+    // Fees in basis points (100 = 1%)
+    uint16 public founderBP   = 1400; // 14%
+    uint16 public ecosystemBP = 600;  // 6%
+    uint16 public rewardsBP   = 400;  // 4%
+    uint16 public burnBP      = 100;  // 1%
+    uint16 public constant MAX_TOTAL_BP = 2500; // 25% hard cap
+    bool   public feesEnabled = true;
+
+    mapping(address => bool) public isExcludedFromFees;
+
+    event FeesUpdated(uint16 founderBP, uint16 ecosystemBP, uint16 rewardsBP, uint16 burnBP, bool enabled);
+    event WalletsUpdated(address founder, address ecosystem, address rewards);
+    event ExcludedFromFees(address indexed account, bool isExcluded);
+
+    // ───────────────────────────────── constructor ────────────────────────────
+    constructor() {
+        // exclude core addresses from fees
+        isExcludedFromFees[address(this)] = true;
+        isExcludedFromFees[owner] = true;
+        isExcludedFromFees[founderWallet] = true;
+        isExcludedFromFees[ecosystemWallet] = true;
+        isExcludedFromFees[rewardsWallet] = true;
+        isExcludedFromFees[DEAD] = true;
+
+        // Mint total supply to deployer (owner)
+        uint256 supply = 10_000_000_000 * 10**decimals; // 10B
+        _mint(owner, supply);
+
+        // Send 30% to founder wallet immediately
+        uint256 founderAllocation = (supply * 30) / 100;
+        _transfer(owner, founderWallet, founderAllocation);
+    }
+
+    // ───────────────────────────────── view ───────────────────────────────────
+    function name() external pure override returns (string memory) { return _name; }
+    function symbol() external pure override returns (string memory) { return _symbol; }
+    function totalSupply() external view override returns (uint256) { return _totalSupply; }
+    function balanceOf(address a) public view override returns (uint256) { return _balances[a]; }
+    function allowance(address a, address s) external view override returns (uint256) { return _allowances[a][s]; }
+
+    // ───────────────────────────────── ERC20 core ─────────────────────────────
+    function approve(address spender, uint256 amount) public override returns (bool) {
+        _allowances[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        _transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
+        uint256 cur = _allowances[from][msg.sender];
+        require(cur >= amount, "ERC20: allowance");
+        unchecked { _allowances[from][msg.sender] = cur - amount; }
+        emit Approval(from, msg.sender, _allowances[from][msg.sender]);
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    // ───────────────────────────── internal helpers ───────────────────────────
+    function _mint(address to, uint256 amount) internal {
+        require(to != address(0), "mint to zero");
+        _totalSupply += amount;
+        _balances[to] += amount;
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal {
+        require(from != address(0), "burn from zero");
+        uint256 bal = _balances[from];
+        require(bal >= amount, "burn > balance");
+        unchecked { _balances[from] = bal - amount; }
+        _totalSupply -= amount;
+        emit Transfer(from, DEAD, amount);
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal {
+        require(from != address(0) && to != address(0), "zero addr");
+        uint256 bal = _balances[from];
+        require(bal >= amount, "insufficient balance");
+
+        // default: no fees
+        uint256 sendAmount = amount;
+
+        if (
+            feesEnabled &&
+            !isExcludedFromFees[from] &&
+            !isExcludedFromFees[to]
+        ) {
+            // compute fees
+            uint256 founderAmt   = (amount * founderBP)   / 10000;
+            uint256 ecosystemAmt = (amount * ecosystemBP) / 10000;
+            uint256 rewardsAmt   = (amount * rewardsBP)   / 10000;
+            uint256 burnAmt      = (amount * burnBP)      / 10000;
+
+            uint256 feeTotal = founderAmt + ecosystemAmt + rewardsAmt + burnAmt;
+            require(feeTotal <= (amount * MAX_TOTAL_BP) / 10000, "fee too high");
+
+            // apply: burn first (reduces total supply)
+            if (burnAmt > 0) {
+                unchecked { _balances[from] -= burnAmt; }
+                _burn(from, burnAmt);
+            }
+
+            // transfer fee tokens
+            if (founderAmt > 0)   _rawTransfer(from, founderWallet,   founderAmt);
+            if (ecosystemAmt > 0) _rawTransfer(from, ecosystemWallet, ecosystemAmt);
+            if (rewardsAmt > 0)   _rawTransfer(from, rewardsWallet,   rewardsAmt);
+
+            unchecked { sendAmount = amount - feeTotal; }
+        }
+
+        _rawTransfer(from, to, sendAmount);
+    }
+
+    function _rawTransfer(address from, address to, uint256 amount) internal {
+        unchecked {
+            _balances[from] -= amount;
+            _balances[to]   += amount;
+        }
+        emit Transfer(from, to, amount);
+    }
+
+    // ───────────────────────────── owner controls ─────────────────────────────
+    function setFees(
+        uint16 _founderBP,
+        uint16 _ecosystemBP,
+        uint16 _rewardsBP,
+        uint16 _burnBP,
+        bool   _enabled
+    ) external onlyOwner {
+        uint32 sum = uint32(_founderBP) + _ecosystemBP + _rewardsBP + _burnBP;
+        require(sum <= MAX_TOTAL_BP, "sum > 25%");
+        founderBP   = _founderBP;
+        ecosystemBP = _ecosystemBP;
+        rewardsBP   = _rewardsBP;
+        burnBP      = _burnBP;
+        feesEnabled = _enabled;
+        emit FeesUpdated(founderBP, ecosystemBP, rewardsBP, burnBP, feesEnabled);
+    }
+
+    function setWallets(
+        address _founder,
+        address _ecosystem,
+        address _rewards
+    ) external onlyOwner {
+        require(_founder != address(0) && _ecosystem != address(0) && _rewards != address(0), "zero wallet");
+        founderWallet   = _founder;
+        ecosystemWallet = _ecosystem;
+        rewardsWallet   = _rewards;
+
+        isExcludedFromFees[_founder]   = true;
+        isExcludedFromFees[_ecosystem] = true;
+        isExcludedFromFees[_rewards]   = true;
+
+        emit WalletsUpdated(_founder, _ecosystem, _rewards);
+    }
+
+    function excludeFromFees(address account, bool excluded) external onlyOwner {
+        isExcludedFromFees[account] = excluded;
+        emit ExcludedFromFees(account, excluded);
+    }
+
+    // Rescue functions (no impact on LP or holdings)
+    function rescueTokens(address token, uint256 amount, address to) external onlyOwner {
+        require(to != address(0), "zero to");
+        if (token == address(this)) {
+            _rawTransfer(address(this), to, amount);
+        } else {
+            (bool ok, bytes memory data) = token.call(
+                abi.encodeWithSignature("transfer(address,uint256)", to, amount)
+            );
+            require(ok && (data.length == 0 || abi.decode(data, (bool))), "rescue fail");
+        }
+    }
+
+    receive() external payable {}
+    function rescueBNB(address payable to, uint256 amount) external onlyOwner {
+        require(to != address(0), "zero to");
+        (bool ok, ) = to.call{value: amount}("");
+        require(ok, "BNB send fail");
+    }
+}
